@@ -16,7 +16,7 @@ Bu depo, hekimlerin e-Nabız üzerindeki hasta değerlendirme süreçlerini hız
 
 ---
 
-## 🛠 Script Özellikleri ve Kapsamı
+## Script Özellikleri ve Kapsamı
 
 ### 1. Görüntü Raporları Dışa Aktarıcı (`.md`)
 * **Kapsam:** `/DoktorErisim/Goruntuler*`
