@@ -1,6 +1,6 @@
 # e-Nabız Userscript Araç Seti
 
-Bu depo, hekimlerin e-Nabız üzerindeki hasta değerlendirme süreçlerini hızlandırmak, klinik verileri normalize etmek ve kayıtları yapay zeka (LLM/Claude/GPT) analizine uygun formatlarda dışa aktarmak için geliştirilmiş Tampermonkey kullanıcı betiklerini (userscripts) içerir.
+Bu depo, hekimlerin e-Nabız üzerindeki hasta değerlendirme süreçlerini hızlandırmak, klinik verileri normalize etmek ve kayıtları yapay zeka (ChatGPT, Claude, Perplexity vb.) analizine uygun formatlarda dışa aktarmak için geliştirilmiş Tampermonkey kullanıcı betiklerini (userscripts) içerir.
 
 ---
 
