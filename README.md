@@ -9,12 +9,14 @@ Bu depo, hekimlerin e-Nabız üzerindeki hasta değerlendirme süreçlerini hız
 1. Tarayıcınıza [Tampermonkey](https://www.tampermonkey.net/) uzantısını kurun.
 2. İlgili araca tıklayarak tek tıkla yükleyin:
 
+| Araç Adı | Kapsam | Çıktı Formatı | Kurulum Bağlantısı |
+| :--- | :--- | :--- | :--- |
 | **Görüntü Raporları Aktarıcı** | Radyoloji / Görüntüleme Raporları | `.md` (Markdown) | [📥 Scripti Kur](https://github.com/keagenmert/enabiz-userscripts/raw/main/enabiz-goruntu-rapor-aktarici.user.js) |
 | **Klinik Veri Aktarıcı** | Tahliller, Epikrizler, Tanılar, İlaçlar | `.csv` (Normalize CSV) | [📥 Scripti Kur](https://github.com/keagenmert/enabiz-userscripts/raw/main/enabiz-klinik-veri-aktarici.user.js) |
 
 ---
 
-## Script Özellikleri ve Kapsamı
+## 🛠 Script Özellikleri ve Kapsamı
 
 ### 1. Görüntü Raporları Dışa Aktarıcı (`.md`)
 * **Kapsam:** `/DoktorErisim/Goruntuler*`
