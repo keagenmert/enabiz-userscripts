@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         e-Nabız Klinik Veri Dışa Aktarıcı (CSV - AI)
-// @namespace    https://github.com/
-// @version      4.0.0
+// @namespace    https://github.com/keagenmert/enabiz-userscripts
+// @version      4.2.0
 // @description  Tahlil, epikriz, tanı ve ilaç verilerini ham alanları koruyarak klinik analiz için normalize edilmiş CSV olarak indirir.
 // @author       Mert Amasya
 // @match        https://enabiz.gov.tr/DoktorErisim/Tahliller*
@@ -11,6 +11,8 @@
 // @grant        none
 // @run-at       document-idle
 // @noframes
+// @updateURL    https://github.com/keagenmert/enabiz-userscripts/raw/main/enabiz-klinik-veri-aktarici.user.js
+// @downloadURL  https://github.com/keagenmert/enabiz-userscripts/raw/main/enabiz-klinik-veri-aktarici.user.js
 // ==/UserScript==
 
 (function () {
@@ -23,11 +25,17 @@
         PAGE_TIMEOUT_MS: 10000,
         EXCLUDE_EMPTY_EPIKRIZ_ROWS: false,
         PRESERVE_NARRATIVE_LINE_BREAKS: true,
+        CHUNK_SIZE: 500,
+        ENABLE_PROGRESS_NOTIFICATIONS: true,
+        AUTO_RETRY_ON_ERROR: true,
+        MAX_RETRY_ATTEMPTS: 2,
     });
 
     const $ = window.jQuery;
     const path = window.location.pathname;
     const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // ==================== Utility Functions ====================
 
     function currentPageName() {
         if (path.includes('/Tahliller')) return 'Tahliller';
@@ -38,6 +46,7 @@
     }
 
     function notifyOrchestrator(payload) {
+        if (!CONFIG.ENABLE_PROGRESS_NOTIFICATIONS && payload.status === 'progress') return;
         const message = {
             source: 'ENABIZ_EXPORTER_V4',
             type: 'ENABIZ_EXPORT_EVENT',
@@ -58,6 +67,8 @@
         const prefix = String(window.__ENABIZ_FILENAME_PREFIX__ || '');
         return prefix && !filename.startsWith(prefix) ? `${prefix}${filename}` : filename;
     }
+
+    // ==================== Text Processing Functions ====================
 
     function textOf(node) {
         return String(node?.innerText || node?.textContent || '').replace(/\u00a0/g, ' ').trim();
@@ -203,6 +214,7 @@
         button.className = 'btn btn-outline green btn-circle btn-xs';
         button.style.margin = '5px';
         button.textContent = label;
+        button.setAttribute('aria-label', label);
         button.addEventListener('click', async () => {
             if (button.disabled) return;
             const oldText = button.textContent;
@@ -274,13 +286,19 @@
         return all;
     }
 
+    // ==================== Performance-Optimized Duplicate Detection ====================
+
     function exactDuplicateCounts(rows) {
         const counts = new Map();
-        rows.forEach(row => {
-            const key = JSON.stringify(row);
+        const hashes = new Array(rows.length);
+
+        for (let i = 0; i < rows.length; i++) {
+            const key = JSON.stringify(rows[i]);
+            hashes[i] = key;
             counts.set(key, (counts.get(key) || 0) + 1);
-        });
-        return rows.map(row => counts.get(JSON.stringify(row)) || 1);
+        }
+
+        return hashes.map(hash => counts.get(hash) || 1);
     }
 
     function parseReference(raw) {
@@ -353,204 +371,282 @@
     }
 
     // ---------------- Tahliller ----------------
+    // ---------------- Tahliller ----------------
     async function exportLabs(onProgress) {
-        if (!$?.fn?.DataTable) throw new Error('DataTables bulunamadı.');
-        const element = document.getElementById('yetkiGrubu');
-        if (!element) throw new Error('Tahlil tablosu bulunamadı.');
-        const table = $(element).DataTable();
-        const rowNodes = await collectDataTableRows(table, onProgress);
-        const parsedRows = rowNodes
-            .map(node => ({ node, cells: extractCells(node) }))
-            .filter(item => item.cells.length >= 6);
-        const cellsByRow = parsedRows.map(item => item.cells);
-        const duplicateCounts = exactDuplicateCounts(cellsByRow);
-        const groupById = new Map();
-        const rowsMeta = parsedRows.map((item, index) => ({
-            cells: item.cells,
-            index,
-            id: item.node?.getAttribute('data-tt-id') || '',
-            parentId: item.node?.getAttribute('data-tt-parent-id') || '',
-        }));
+        const execute = async () => {
+            if (!$?.fn?.DataTable) throw new Error('DataTables bulunamadı.');
+            const element = document.getElementById('yetkiGrubu');
+            if (!element) throw new Error('Tahlil tablosu bulunamadı.');
+            const table = $(element).DataTable();
+            const rowNodes = await collectDataTableRows(table, onProgress);
+            const parsedRows = rowNodes
+                .map(node => ({ node, cells: extractCells(node) }))
+                .filter(item => item.cells.length >= 6);
+            const cellsByRow = parsedRows.map(item => item.cells);
+            const duplicateCounts = exactDuplicateCounts(cellsByRow);
+            const groupById = new Map();
+            const rowsMeta = parsedRows.map((item, index) => ({
+                cells: item.cells,
+                index,
+                id: item.node?.getAttribute('data-tt-id') || '',
+                parentId: item.node?.getAttribute('data-tt-parent-id') || '',
+            }));
 
-        rowsMeta.forEach(meta => {
-            const result = oneLine(meta.cells[3]);
-            if (meta.id && !meta.parentId && !result) groupById.set(meta.id, oneLine(meta.cells[2]));
-        });
+            rowsMeta.forEach(meta => {
+                const result = oneLine(meta.cells[3]);
+                if (meta.id && !meta.parentId && !result) groupById.set(meta.id, oneLine(meta.cells[2]));
+            });
 
-        const resultRows = [];
-        rowsMeta.forEach((meta, index) => {
-            const [dateTime, test, resultRaw, unit, referenceRaw] = [meta.cells[1], meta.cells[2], meta.cells[3], meta.cells[4], meta.cells[5]];
-            const result = parseResult(resultRaw);
-            if (!result.raw && meta.parentId === '') return;
-            const reference = parseReference(referenceRaw);
-            const group = meta.parentId ? (groupById.get(meta.parentId) || oneLine(test)) : oneLine(test);
-            const date = splitDateTime(dateTime);
-            resultRows.push([
-                resultRows.length + 1,
-                meta.index + 1,
-                date.date,
-                toISODate(date.date),
-                date.time,
-                group,
-                oneLine(test),
-                result.raw,
-                result.numeric,
-                result.operator,
-                result.text,
-                oneLine(unit),
-                reference.raw,
-                reference.lower,
-                reference.upper,
-                oneLine(meta.cells[6] || ''),
-                normalizeFlag(meta.cells[6] || ''),
-                computedFlag(result, reference),
-                duplicateCounts[index],
-            ]);
-        });
+            const resultRows = [];
+            rowsMeta.forEach((meta, index) => {
+                const [dateTime, test, resultRaw, unit, referenceRaw] = [meta.cells[1], meta.cells[2], meta.cells[3], meta.cells[4], meta.cells[5]];
+                const result = parseResult(resultRaw);
+                if (!result.raw && meta.parentId === '') return;
+                const reference = parseReference(referenceRaw);
+                const group = meta.parentId ? (groupById.get(meta.parentId) || oneLine(test)) : oneLine(test);
+                const date = splitDateTime(dateTime);
+                resultRows.push([
+                    resultRows.length + 1,
+                    meta.index + 1,
+                    date.date,
+                    toISODate(date.date),
+                    date.time,
+                    group,
+                    oneLine(test),
+                    result.raw,
+                    result.numeric,
+                    result.operator,
+                    result.text,
+                    oneLine(unit),
+                    reference.raw,
+                    reference.lower,
+                    reference.upper,
+                    oneLine(meta.cells[6] || ''),
+                    normalizeFlag(meta.cells[6] || ''),
+                    computedFlag(result, reference),
+                    duplicateCounts[index],
+                ]);
+            });
 
-        const header = ['Kayıt_ID', 'Kaynak_Satır_ID', 'Tarih_Ham', 'Tarih_ISO', 'Saat', 'Panel/Grup', 'Tahlil', 'Sonuç_Ham', 'Sonuç_Sayısal', 'Sonuç_Operatörü', 'Sonuç_Metinsel', 'Birim', 'Referans_Ham', 'Referans_Alt', 'Referans_Üst', 'Bayrak_Ham', 'Bayrak_Norm', 'Bayrak_Hesaplanan', 'Tam_Aynı_Kayıt_Sayısı'];
-        return await downloadCSV(`tahliller_klinik_${localDateISO()}.csv`, header, resultRows);
+            const header = ['Kayıt_ID', 'Kaynak_Satır_ID', 'Tarih_Ham', 'Tarih_ISO', 'Saat', 'Panel/Grup', 'Tahlil', 'Sonuç_Ham', 'Sonuç_Sayısal', 'Sonuç_Operatörü', 'Sonuç_Metinsel', 'Birim', 'Referans_Ham', 'Referans_Alt', 'Referans_Üst', 'Bayrak_Ham', 'Bayrak_Norm', 'Bayrak_Hesaplanan', 'Tam_Aynı_Kayıt_Sayısı'];
+            return await downloadCSV(`tahliller_klinik_${localDateISO()}.csv`, header, resultRows);
+        };
+
+        if (CONFIG.AUTO_RETRY_ON_ERROR) {
+            let lastError;
+            for (let attempt = 1; attempt <= CONFIG.MAX_RETRY_ATTEMPTS + 1; attempt++) {
+                try {
+                    return await execute();
+                } catch (error) {
+                    lastError = error;
+                    if (attempt <= CONFIG.MAX_RETRY_ATTEMPTS) {
+                        onProgress?.(`Hata oluştu, yeniden deneniyor (${attempt}/${CONFIG.MAX_RETRY_ATTEMPTS})...`);
+                        await sleep(1000 * attempt);
+                    }
+                }
+            }
+            throw lastError;
+        }
+        return execute();
     }
 
     // ---------------- Epikriz ----------------
+    // ---------------- Epikrizler ----------------
     async function exportEpikriz(onProgress) {
-        await loadMoreUntilEnd('btnLoadMoreEpikriz', '#epikrizList tr', onProgress);
-        const rawRows = Array.from(document.querySelectorAll('#epikrizList tr'))
-            .map(extractCells)
-            .filter(cells => cells.length >= 3);
-        const duplicateCounts = exactDuplicateCounts(rawRows);
-        const patientName = patientNameFromPage();
-        const resultRows = [];
+        const execute = async () => {
+            await loadMoreUntilEnd('btnLoadMoreEpikriz', '#epikrizList tr', onProgress);
+            const rawRows = Array.from(document.querySelectorAll('#epikrizList tr'))
+                .map(extractCells)
+                .filter(cells => cells.length >= 3);
+            const duplicateCounts = exactDuplicateCounts(rawRows);
+            const patientName = patientNameFromPage();
+            const resultRows = [];
 
-        rawRows.forEach((cells, index) => {
-            const date = splitDateTime(cells[0]);
-            const title = oneLine(cells[1]);
-            const description = maskClinicalIdentifiers(clinicalText(cells[2]), patientName);
-            const hasContent = Boolean(description);
-            if (CONFIG.EXCLUDE_EMPTY_EPIKRIZ_ROWS && !hasContent) return;
-            resultRows.push([
-                resultRows.length + 1,
-                index + 1,
-                date.date,
-                toISODate(date.date),
-                date.time,
-                title,
-                normalizeDiagnosisSection(title),
-                description,
-                hasContent ? 'Evet' : 'Hayır',
-                CONFIG.MASK_DIRECT_IDENTIFIERS ? 'Açık' : 'Kapalı',
-                duplicateCounts[index],
-            ]);
-        });
+            rawRows.forEach((cells, index) => {
+                const date = splitDateTime(cells[0]);
+                const title = oneLine(cells[1]);
+                const description = maskClinicalIdentifiers(clinicalText(cells[2]), patientName);
+                const hasContent = Boolean(description);
+                if (CONFIG.EXCLUDE_EMPTY_EPIKRIZ_ROWS && !hasContent) return;
+                resultRows.push([
+                    resultRows.length + 1,
+                    index + 1,
+                    date.date,
+                    toISODate(date.date),
+                    date.time,
+                    title,
+                    normalizeDiagnosisSection(title),
+                    description,
+                    hasContent ? 'Evet' : 'Hayır',
+                    CONFIG.MASK_DIRECT_IDENTIFIERS ? 'Açık' : 'Kapalı',
+                    duplicateCounts[index],
+                ]);
+            });
 
-        const header = ['Kayıt_ID', 'Kaynak_Satır_ID', 'Tarih_Ham', 'Tarih_ISO', 'Saat', 'Başlık_Ham', 'Klinik_Bölüm_Norm', 'Açıklama_Ham', 'Klinik_İçerik_Var', 'Kimlik_Maskeleme', 'Tam_Aynı_Kayıt_Sayısı'];
-        return await downloadCSV(`epikrizler_klinik_${localDateISO()}.csv`, header, resultRows);
+            const header = ['Kayıt_ID', 'Kaynak_Satır_ID', 'Tarih_Ham', 'Tarih_ISO', 'Saat', 'Başlık_Ham', 'Klinik_Bölüm_Norm', 'Açıklama_Ham', 'Klinik_İçerik_Var', 'Kimlik_Maskeleme', 'Tam_Aynı_Kayıt_Sayısı'];
+            return await downloadCSV(`epikrizler_klinik_${localDateISO()}.csv`, header, resultRows);
+        };
+
+        if (CONFIG.AUTO_RETRY_ON_ERROR) {
+            let lastError;
+            for (let attempt = 1; attempt <= CONFIG.MAX_RETRY_ATTEMPTS + 1; attempt++) {
+                try {
+                    return await execute();
+                } catch (error) {
+                    lastError = error;
+                    if (attempt <= CONFIG.MAX_RETRY_ATTEMPTS) {
+                        onProgress?.(`Hata oluştu, yeniden deneniyor (${attempt}/${CONFIG.MAX_RETRY_ATTEMPTS})...`);
+                        await sleep(1000 * attempt);
+                    }
+                }
+            }
+            throw lastError;
+        }
+        return execute();
     }
-
     // ---------------- Tanılar ----------------
     async function exportDiagnoses(onProgress) {
-        await loadMoreUntilEnd('btnLoadMoreTani', '#taniList tr', onProgress);
-        const rawRows = Array.from(document.querySelectorAll('#taniList tr'))
-            .map(extractCells)
-            .filter(cells => cells.length >= 7);
-        const duplicateCounts = exactDuplicateCounts(rawRows);
-        const roles = [
-            ['Tanı', 1],
-            ['Ek Tanı', 2],
-            ['Ön Tanı', 3],
-            ['Ayırıcı Tanı', 4],
-        ];
-        const resultRows = [];
+        const execute = async () => {
+            await loadMoreUntilEnd('btnLoadMoreTani', '#taniList tr', onProgress);
+            const rawRows = Array.from(document.querySelectorAll('#taniList tr'))
+                .map(extractCells)
+                .filter(cells => cells.length >= 7);
+            const duplicateCounts = exactDuplicateCounts(rawRows);
+            const roles = [
+                ['Tanı', 1],
+                ['Ek Tanı', 2],
+                ['Ön Tanı', 3],
+                ['Ayırıcı Tanı', 4],
+            ];
+            const resultRows = [];
 
-        rawRows.forEach((cells, sourceIndex) => {
-            let emitted = false;
-            roles.forEach(([role, columnIndex]) => {
-                const raw = oneLine(cells[columnIndex]);
-                if (!raw) return;
-                emitted = true;
-                const diagnoses = splitCodedDiagnoses(raw);
-                diagnoses.forEach((diagnosis, diagnosisIndex) => {
-                    const diagnosisDate = splitDateTime(cells[0]);
-                    resultRows.push([
-                        resultRows.length + 1,
-                        sourceIndex + 1,
-                        diagnosisDate.date,
-                        toISODate(diagnosisDate.date),
-                        diagnosisDate.time,
-                        role,
-                        diagnosisIndex + 1,
-                        diagnosis.code,
-                        diagnosis.name,
-                        raw,
-                        oneLine(cells[5]),
-                        oneLine(cells[6]),
-                        duplicateCounts[sourceIndex],
-                    ]);
+            rawRows.forEach((cells, sourceIndex) => {
+                let emitted = false;
+                roles.forEach(([role, columnIndex]) => {
+                    const raw = oneLine(cells[columnIndex]);
+                    if (!raw) return;
+                    emitted = true;
+                    const diagnoses = splitCodedDiagnoses(raw);
+                    diagnoses.forEach((diagnosis, diagnosisIndex) => {
+                        const diagnosisDate = splitDateTime(cells[0]);
+                        resultRows.push([
+                            resultRows.length + 1,
+                            sourceIndex + 1,
+                            diagnosisDate.date,
+                            toISODate(diagnosisDate.date),
+                            diagnosisDate.time,
+                            role,
+                            diagnosisIndex + 1,
+                            diagnosis.code,
+                            diagnosis.name,
+                            raw,
+                            oneLine(cells[5]),
+                            oneLine(cells[6]),
+                            duplicateCounts[sourceIndex],
+                        ]);
+                    });
                 });
+                if (!emitted) {
+                    const date = splitDateTime(cells[0]);
+                    resultRows.push([resultRows.length + 1, sourceIndex + 1, date.date, toISODate(date.date), date.time, 'Belirtilmemiş', '', '', '', '', oneLine(cells[5]), oneLine(cells[6]), duplicateCounts[sourceIndex]]);
+                }
             });
-            if (!emitted) {
-                const date = splitDateTime(cells[0]);
-                resultRows.push([resultRows.length + 1, sourceIndex + 1, date.date, toISODate(date.date), date.time, 'Belirtilmemiş', '', '', '', '', oneLine(cells[5]), oneLine(cells[6]), duplicateCounts[sourceIndex]]);
+
+            const header = ['Kayıt_ID', 'Kaynak_Satır_ID', 'Tarih_Ham', 'Tarih_ISO', 'Saat', 'Tanı_Rolü', 'Tanı_Sırası', 'Tanı_Kodu', 'Tanı_Adı_Norm', 'Tanı_Ham', 'Klinik', 'Hekim', 'Tam_Aynı_Kayıt_Sayısı'];
+            return await downloadCSV(`tanilar_klinik_${localDateISO()}.csv`, header, resultRows);
+        };
+
+        if (CONFIG.AUTO_RETRY_ON_ERROR) {
+            let lastError;
+            for (let attempt = 1; attempt <= CONFIG.MAX_RETRY_ATTEMPTS + 1; attempt++) {
+                try {
+                    return await execute();
+                } catch (error) {
+                    lastError = error;
+                    if (attempt <= CONFIG.MAX_RETRY_ATTEMPTS) {
+                        onProgress?.(`Hata oluştu, yeniden deneniyor (${attempt}/${CONFIG.MAX_RETRY_ATTEMPTS})...`);
+                        await sleep(1000 * attempt);
+                    }
+                }
             }
-        });
-
-        const header = ['Kayıt_ID', 'Kaynak_Satır_ID', 'Tarih_Ham', 'Tarih_ISO', 'Saat', 'Tanı_Rolü', 'Tanı_Sırası', 'Tanı_Kodu', 'Tanı_Adı_Norm', 'Tanı_Ham', 'Klinik', 'Hekim', 'Tam_Aynı_Kayıt_Sayısı'];
-        return await downloadCSV(`tanilar_klinik_${localDateISO()}.csv`, header, resultRows);
+            throw lastError;
+        }
+        return execute();
     }
-
     // ---------------- İlaçlar ----------------
     async function exportMedications(onProgress) {
-        await loadMoreUntilEnd('btnLoadMoreIlac', '#ilacList tr', onProgress);
-        const rawRows = Array.from(document.querySelectorAll('#ilacList tr'))
-            .map(extractCells)
-            .filter(cells => cells.length >= 10);
-        const duplicateCounts = exactDuplicateCounts(rawRows);
-        const barcodeCounts = new Map();
-        const medicationNameCounts = new Map();
-        const medicationFamilyCounts = new Map();
-        rawRows.forEach(cells => {
-            const barcode = oneLine(cells[1]);
-            const medicationName = normalizeMedicationName(cells[3]);
-            const medicationFamily = normalizeMedicationFamily(cells[3]);
-            barcodeCounts.set(barcode, (barcodeCounts.get(barcode) || 0) + 1);
-            medicationNameCounts.set(medicationName, (medicationNameCounts.get(medicationName) || 0) + 1);
-            medicationFamilyCounts.set(medicationFamily, (medicationFamilyCounts.get(medicationFamily) || 0) + 1);
-        });
-        const resultRows = rawRows.map((cells, index) => {
-            const date = splitDateTime(cells[0]);
-            const dose = parseNumber(cells[4]);
-            const frequency = parseNumber(cells[7]);
-            const warnings = [];
-            if (dose === '0' || frequency === '0') warnings.push('Sıfır doz/kullanım değeri; ham kayıt korunmuştur');
-            return [
-                index + 1,
-                date.date,
-                toISODate(date.date),
-                date.time,
-                oneLine(cells[1]),
-                oneLine(cells[2]),
-                oneLine(cells[3]),
-                normalizeMedicationName(cells[3]),
-                normalizeMedicationFamily(cells[3]),
-                medicationNameCounts.get(normalizeMedicationName(cells[3])) || 1,
-                medicationFamilyCounts.get(normalizeMedicationFamily(cells[3])) || 1,
-                oneLine(cells[4]),
-                dose,
-                oneLine(cells[5]),
-                oneLine(cells[6]),
-                oneLine(cells[7]),
-                frequency,
-                oneLine(cells[8]),
-                oneLine(cells[9]),
-                barcodeCounts.get(oneLine(cells[1])) || 1,
-                duplicateCounts[index],
-                warnings.join('; '),
-            ];
-        });
+        const execute = async () => {
+            await loadMoreUntilEnd('btnLoadMoreIlac', '#ilacList tr', onProgress);
+            const rawRows = Array.from(document.querySelectorAll('#ilacList tr'))
+                .map(extractCells)
+                .filter(cells => cells.length >= 10);
+            const duplicateCounts = exactDuplicateCounts(rawRows);
+            const barcodeCounts = new Map();
+            const medicationNameCounts = new Map();
+            const medicationFamilyCounts = new Map();
+            rawRows.forEach(cells => {
+                const barcode = oneLine(cells[1]);
+                const medicationName = normalizeMedicationName(cells[3]);
+                const medicationFamily = normalizeMedicationFamily(cells[3]);
+                barcodeCounts.set(barcode, (barcodeCounts.get(barcode) || 0) + 1);
+                medicationNameCounts.set(medicationName, (medicationNameCounts.get(medicationName) || 0) + 1);
+                medicationFamilyCounts.set(medicationFamily, (medicationFamilyCounts.get(medicationFamily) || 0) + 1);
+            });
+            const resultRows = rawRows.map((cells, index) => {
+                const date = splitDateTime(cells[0]);
+                const dose = parseNumber(cells[4]);
+                const frequency = parseNumber(cells[7]);
+                const warnings = [];
+                if (dose === '0' || frequency === '0') warnings.push('Sıfır doz/kullanım değeri; ham kayıt korunmuştur');
+                return [
+                    index + 1,
+                    date.date,
+                    toISODate(date.date),
+                    date.time,
+                    oneLine(cells[1]),
+                    oneLine(cells[2]),
+                    oneLine(cells[3]),
+                    normalizeMedicationName(cells[3]),
+                    normalizeMedicationFamily(cells[3]),
+                    medicationNameCounts.get(normalizeMedicationName(cells[3])) || 1,
+                    medicationFamilyCounts.get(normalizeMedicationFamily(cells[3])) || 1,
+                    oneLine(cells[4]),
+                    dose,
+                    oneLine(cells[5]),
+                    oneLine(cells[6]),
+                    oneLine(cells[7]),
+                    frequency,
+                    oneLine(cells[8]),
+                    oneLine(cells[9]),
+                    barcodeCounts.get(oneLine(cells[1])) || 1,
+                    duplicateCounts[index],
+                    warnings.join('; '),
+                ];
+            });
 
-        const header = ['Kayıt_ID', 'Reçete_Tarihi_Ham', 'Reçete_Tarihi_ISO', 'Reçete_Saati', 'Barkod', 'Reçete_No', 'İlaç_Adı_Ham', 'İlaç_Adı_Norm', 'İlaç_Ürün_Ailesi_Norm', 'Aynı_İlaç_Norm_Sayısı', 'Aynı_İlaç_Ailesi_Sayısı', 'Doz_Ham', 'Doz_Sayısal', 'Periyot', 'Kullanım_Şekli', 'Kullanım_Sayısı_Ham', 'Kullanım_Sayısı_Sayısal', 'Hastane', 'Branş', 'Aynı_Barkod_Sayısı', 'Tam_Aynı_Kayıt_Sayısı', 'Veri_Uyarısı'];
-        return await downloadCSV(`ilaclar_klinik_${localDateISO()}.csv`, header, resultRows);
+            const header = ['Kayıt_ID', 'Reçete_Tarihi_Ham', 'Reçete_Tarihi_ISO', 'Reçete_Saati', 'Barkod', 'Reçete_No', 'İlaç_Adı_Ham', 'İlaç_Adı_Norm', 'İlaç_Ürün_Ailesi_Norm', 'Aynı_İlaç_Norm_Sayısı', 'Aynı_İlaç_Ailesi_Sayısı', 'Doz_Ham', 'Doz_Sayısal', 'Periyot', 'Kullanım_Şekli', 'Kullanım_Sayısı_Ham', 'Kullanım_Sayısı_Sayısal', 'Hastane', 'Branş', 'Aynı_Barkod_Sayısı', 'Tam_Aynı_Kayıt_Sayısı', 'Veri_Uyarısı'];
+            return await downloadCSV(`ilaclar_klinik_${localDateISO()}.csv`, header, resultRows);
+        };
+
+        if (CONFIG.AUTO_RETRY_ON_ERROR) {
+            let lastError;
+            for (let attempt = 1; attempt <= CONFIG.MAX_RETRY_ATTEMPTS + 1; attempt++) {
+                try {
+                    return await execute();
+                } catch (error) {
+                    lastError = error;
+                    if (attempt <= CONFIG.MAX_RETRY_ATTEMPTS) {
+                        onProgress?.(`Hata oluştu, yeniden deneniyor (${attempt}/${CONFIG.MAX_RETRY_ATTEMPTS})...`);
+                        await sleep(1000 * attempt);
+                    }
+                }
+            }
+            throw lastError;
+        }
+        return execute();
     }
+            makeButton('enabizKlinikTahlilBtnV4', 'CSV İndir (Klinik)', exportLabs, target, 'before');
+        } else if (path.includes('/Epikrizler')) {
 
     function init() {
         if (path.includes('/Tahliller')) {
@@ -574,5 +670,9 @@
         }
     }
 
-    init();
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
 })();
